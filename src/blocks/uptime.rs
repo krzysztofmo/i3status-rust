@@ -92,15 +92,15 @@ impl Block for Uptime {
 
         // Display the two largest units.
         let text = if hours == 0 && days == 0 && weeks == 0 {
-            format!("{}m {}s", minutes, seconds)
+            format!(" {}m {}s", minutes, seconds)
         } else if hours > 0 && days == 0 && weeks == 0 {
-            format!("{}h {}m", hours, minutes)
+            format!(" {}h {}m", hours, minutes)
         } else if days > 0 && weeks == 0 {
-            format!("{}d {}h", days, hours)
+            format!(" {}d {}h", days, hours)
         } else if days == 0 && weeks > 0 {
-            format!("{}w {}h", weeks, hours)
+            format!(" {}w {}h", weeks, hours)
         } else if weeks > 0 {
-            format!("{}w {}d", weeks, days)
+            format!(" {}w {}d", weeks, days)
         } else {
             unreachable!()
         };
