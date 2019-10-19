@@ -1,19 +1,23 @@
 use std::collections::HashMap;
+use std::env;
 use std::process::Command;
 use std::time::Duration;
-use chan::Sender;
+use crossbeam_channel::Sender;
 use serde_json;
 use uuid::Uuid;
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use de::deserialize_duration;
-use errors::*;
-use input::{I3BarEvent, MouseButton};
-use scheduler::Task;
-use util::FormatTemplate;
-use widgets::button::ButtonWidget;
-use widget::I3BarWidget;
+use crate::blocks::{Block, ConfigBlock};
+use crate::config::Config;
+use crate::de::deserialize_duration;
+use crate::errors::*;
+use crate::input::{I3BarEvent, MouseButton};
+use crate::scheduler::Task;
+use crate::util::FormatTemplate;
+use crate::widgets::button::ButtonWidget;
+use crate::widget::I3BarWidget;
+
+const OPENWEATHERMAP_API_KEY_ENV: &str = "OPENWEATHERMAP_API_KEY";
+const OPENWEATHERMAP_CITY_ID_ENV: &str = "OPENWEATHERMAP_CITY_ID";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "name", rename_all = "lowercase")]
@@ -26,10 +30,21 @@ pub enum WeatherService {
     //     units: Option<InputUnit>
     // },
     OpenWeatherMap {
-        api_key: String,
-        city_id: String,
+        #[serde(default = "WeatherService::getenv_openweathermap_api_key")]
+        api_key: Option<String>,
+        #[serde(default = "WeatherService::getenv_openweathermap_city_id")]
+        city_id: Option<String>,
         units: OpenWeatherMapUnits,
     },
+}
+
+impl WeatherService {
+    fn getenv_openweathermap_api_key() -> Option<String> {
+        env::var(OPENWEATHERMAP_API_KEY_ENV).ok()
+    }
+    fn getenv_openweathermap_city_id() -> Option<String> {
+        env::var(OPENWEATHERMAP_CITY_ID_ENV).ok()
+    }
 }
 
 #[derive(Copy, Clone, Debug, Deserialize)]
@@ -48,12 +63,19 @@ pub struct Weather {
     update_interval: Duration,
 }
 
+fn malformed_json_error() -> Error {
+    BlockError(
+            "weather".to_string(),
+            "Malformed JSON.".to_string(),
+    )
+}
+
 impl Weather {
     fn update_weather(&mut self) -> Result<()> {
         match self.service {
             WeatherService::OpenWeatherMap {
-                ref api_key,
-                ref city_id,
+                api_key: Some(ref api_key),
+                city_id: Some(ref city_id),
                 ref units,
             } => {
                 let output = Command::new("sh")
@@ -79,7 +101,7 @@ impl Weather {
 
                 // Don't error out on empty responses e.g. for when not
                 // connected to the internet.
-                if output.len() < 1 {
+                if output.is_empty() {
                     self.weather.set_icon("weather_default");
                     self.weather_keys = HashMap::new();
                     return Ok(());
@@ -97,46 +119,43 @@ impl Weather {
                         format!("API Error: {}", val.as_str().unwrap()),
                     ));
                 };
-                let raw_weather = match json.pointer("/weather/0/main")
+                let raw_weather = json.pointer("/weather/0/main")
                     .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()) {
-                    Some(v) => v,
-                    None => {
-                        return Err(BlockError(
-                            "weather".to_string(),
-                            "Malformed JSON.".to_string(),
-                        ));
+                    .map(|s| s.to_string())
+                    .ok_or_else(malformed_json_error)?;
+
+                let raw_temp = json.pointer("/main/temp").and_then(|v| v.as_f64()).ok_or_else(malformed_json_error)?;
+
+                let raw_wind_speed: f64= json.pointer("/wind/speed")
+                    .map_or(Some(0.0), |v| v.as_f64()) // provide default value 0.0
+                    .ok_or_else(malformed_json_error)?; // error when conversion to f64 fails
+
+                let raw_wind_direction: Option<f64>= json.pointer("/wind/deg")
+                    .map_or(Some(None), |v| v.as_f64().and_then(|v| Some(Some(v)))) // provide default value None
+                    .ok_or_else(malformed_json_error)?; // error when conversion to f64 fails
+
+
+                let raw_location = json.pointer("/name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(malformed_json_error)?;
+
+                // Convert wind direction in azimuth degrees to abbreviation names
+                fn convert_wind_direction(direction_opt: Option<f64>) -> String {
+                    match direction_opt {
+                        Some(direction) => match direction.round() as i64 {
+                            24 ..= 68 => "NE".to_string(),
+                            69 ..= 113 => "E".to_string(),
+                            114 ..= 158 => "SE".to_string(),
+                            159 ..= 203 => "S".to_string(),
+                            204 ..= 248 => "SW".to_string(),
+                            249 ..= 293 => "W".to_string(),
+                            294 ..= 338 => "NW".to_string(),
+                            _ => "N".to_string()
+                        },
+                        None => "-".to_string()
                     }
-                };
-                let raw_temp = match json.pointer("/main/temp").and_then(|v| v.as_f64()) {
-                    Some(v) => v,
-                    None => {
-                        return Err(BlockError(
-                            "weather".to_string(),
-                            "Malformed JSON.".to_string(),
-                        ));
-                    }
-                };
-                let raw_wind = match json.pointer("/wind/speed").and_then(|v| v.as_f64()) {
-                    Some(v) => v,
-                    None => {
-                        return Err(BlockError(
-                            "weather".to_string(),
-                            "Malformed JSON.".to_string(),
-                        ));
-                    }
-                };
-                let raw_location = match json.pointer("/name").and_then(|v| v.as_str()).map(|s| {
-                    s.to_string()
-                }) {
-                    Some(v) => v,
-                    None => {
-                        return Err(BlockError(
-                            "weather".to_string(),
-                            "Malformed JSON.".to_string(),
-                        ));
-                    }
-                };
+                }
 
                 self.weather.set_icon(match raw_weather.as_str() {
                     "Clear" => "weather_sun",
@@ -150,9 +169,32 @@ impl Weather {
                 self.weather_keys =
                     map_to_owned!("{weather}" => raw_weather,
                                   "{temp}" => format!("{:.0}", raw_temp),
-                                  "{wind}" => format!("{:.1}", raw_wind),
+                                  "{wind}" => format!("{:.1}", raw_wind_speed),
+                                  "{direction}" => convert_wind_direction(raw_wind_direction),
                                   "{location}" => raw_location);
                 Ok(())
+            },
+            WeatherService::OpenWeatherMap { ref api_key, ref city_id, .. } => {
+                if let None = api_key {
+                    Err(BlockError(
+                        "weather".to_string(),
+                        format!(
+                            "Missing member 'service.api_key'. Add the member or configure with the environment variable {}",
+                            OPENWEATHERMAP_API_KEY_ENV.to_string()
+                        ),
+                    ))
+                }
+                else if let None = city_id {
+                    Err(BlockError(
+                        "weather".to_string(),
+                        format!(
+                            "Missing member 'service.city_id'. Add the member or configure with the environment variable {}",
+                            OPENWEATHERMAP_CITY_ID_ENV.to_string()
+                        ),
+                    ))
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -202,23 +244,20 @@ impl Block for Weather {
         if self.weather_keys.keys().len() == 0 {
             self.weather.set_text("×".to_string());
         } else {
-            let fmt = FormatTemplate::from_string(self.format.clone())?;
+            let fmt = FormatTemplate::from_string(&self.format)?;
             self.weather.set_text(fmt.render(&self.weather_keys));
         }
         Ok(Some(self.update_interval))
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.weather]
     }
 
     fn click(&mut self, event: &I3BarEvent) -> Result<()> {
         if event.matches_name(self.id()) {
-            match event.button {
-                MouseButton::Left => {
+            if let MouseButton::Left = event.button {
                     self.update()?;
-                }
-                _ => {}
             }
         }
         Ok(())

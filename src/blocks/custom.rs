@@ -3,16 +3,16 @@ use std::process::Command;
 use std::iter::{Cycle, Peekable};
 use std::vec;
 use std::env;
-use chan::Sender;
+use crossbeam_channel::Sender;
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use de::deserialize_duration;
-use errors::*;
-use widgets::button::ButtonWidget;
-use widget::I3BarWidget;
-use input::I3BarEvent;
-use scheduler::Task;
+use crate::blocks::{Block, ConfigBlock};
+use crate::config::Config;
+use crate::de::deserialize_duration;
+use crate::errors::*;
+use crate::widgets::button::ButtonWidget;
+use crate::widget::I3BarWidget;
+use crate::input::I3BarEvent;
+use crate::scheduler::Task;
 
 use uuid::Uuid;
 
@@ -89,7 +89,7 @@ impl Block for Custom {
             .or_else(|| self.command.clone())
             .unwrap_or_else(|| "".to_owned());
 
-        let output = Command::new("sh")
+        let output = Command::new(env::var("SHELL").unwrap_or("sh".to_owned()))
             .args(&["-c", &command_str])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
@@ -100,7 +100,7 @@ impl Block for Custom {
         Ok(Some(self.update_interval))
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.output]
     }
 
@@ -116,7 +116,7 @@ impl Block for Custom {
         let mut update = false;
 
         if let Some(ref on_click) = self.on_click {
-            Command::new(env::var("SHELL").unwrap_or("sh".to_owned()))
+            Command::new(env::var("SHELL").unwrap_or_else(|_|"sh".to_owned()))
                     .args(&["-c", on_click]).output().ok();
             update = true;
         }
@@ -130,7 +130,7 @@ impl Block for Custom {
             self.tx_update_request.send(Task {
                 id: self.id.clone(),
                 update_time: Instant::now(),
-            });
+            })?;
         }
 
         Ok(())

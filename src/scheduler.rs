@@ -1,5 +1,5 @@
-use block::Block;
-use errors::*;
+use crate::blocks::Block;
+use crate::errors::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::thread;
@@ -43,7 +43,7 @@ pub struct UpdateScheduler {
 }
 
 impl UpdateScheduler {
-    pub fn new(blocks: &[Box<Block>]) -> UpdateScheduler {
+    pub fn new(blocks: &[Box<dyn Block>]) -> UpdateScheduler {
         let mut schedule = BinaryHeap::new();
 
         let now = Instant::now();
@@ -54,11 +54,7 @@ impl UpdateScheduler {
             });
         }
 
-        UpdateScheduler { schedule: schedule }
-    }
-
-    pub fn schedule(&mut self, task: Task) {
-        self.schedule.push(task);
+        UpdateScheduler { schedule }
     }
 
     pub fn time_to_next_update(&self) -> Option<Duration> {
@@ -76,7 +72,7 @@ impl UpdateScheduler {
         }
     }
 
-    pub fn do_scheduled_updates(&mut self, block_map: &mut HashMap<String, &mut Block>) -> Result<()> {
+    pub fn do_scheduled_updates(&mut self, block_map: &mut HashMap<String, &mut dyn Block>) -> Result<()> {
         let t = self.schedule
             .pop()
             .internal_error("scheduler", "schedule is empty")?;

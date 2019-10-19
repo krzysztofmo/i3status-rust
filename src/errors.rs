@@ -113,21 +113,21 @@ impl StdError for Error {
         }
     }
 
-    fn cause(&self) -> Option<&StdError> {
+    fn cause(&self) -> Option<&dyn StdError> {
         match *self {
             _ => None,
         }
     }
 }
 
-impl<T> From<::std::sync::mpsc::SendError<T>> for Error
+impl<T> From<::crossbeam_channel::SendError<T>> for Error
 where
-    T: fmt::Display + Send,
+    T: Send,
 {
-    fn from(err: ::std::sync::mpsc::SendError<T>) -> Error {
+    fn from(_err: ::crossbeam_channel::SendError<T>) -> Error {
         InternalError(
             "unknown".to_owned(),
-            format!("send error for '{}'", err.0),
+            format!("send error"),
             None,
         )
     }

@@ -13,31 +13,29 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chan::Sender;
+use crossbeam_channel::Sender;
 use inotify::{EventMask, Inotify, WatchMask};
 use uuid::Uuid;
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use errors::*;
-use input::{I3BarEvent, MouseButton};
-use scheduler::Task;
-use widget::I3BarWidget;
-use widgets::button::ButtonWidget;
+use crate::blocks::{Block, ConfigBlock};
+use crate::config::Config;
+use crate::errors::*;
+use crate::input::{I3BarEvent, MouseButton};
+use crate::scheduler::Task;
+use crate::widget::I3BarWidget;
+use crate::widgets::button::ButtonWidget;
 
 /// Read a brightness value from the given path.
 fn read_brightness(device_file: &Path) -> Result<u64> {
-    let mut file = try!(
-        OpenOptions::new()
+    let mut file = OpenOptions::new()
             .read(true)
             .open(device_file)
-            .block_error("backlight", "Failed to open brightness file")
-    );
+            .block_error("backlight", "Failed to open brightness file")?;
     let mut content = String::new();
-    try!(file.read_to_string(&mut content).block_error(
+    file.read_to_string(&mut content).block_error(
         "backlight",
         "Failed to read brightness file",
-    ));
+    )?;
     // Removes trailing newline.
     content.pop();
     content.parse::<u64>().block_error(
@@ -56,14 +54,12 @@ impl BacklitDevice {
     /// Use the default backlit device, i.e. the first one found in the
     /// `/sys/class/backlight` directory.
     pub fn default() -> Result<Self> {
-        let devices = try!(
-            Path::new("/sys/class/backlight")
+        let devices = Path::new("/sys/class/backlight")
                            .read_dir() // Iterate over entries in the directory.
                            .block_error("backlight",
-                                        "Failed to read backlight device directory")
-        );
+                                        "Failed to read backlight device directory")?;
 
-        let first_device = try!(match devices.take(1).next() {
+        let first_device = match devices.take(1).next() {
             None => Err(BlockError(
                 "backlight".to_string(),
                 "No backlit devices found".to_string(),
@@ -76,12 +72,12 @@ impl BacklitDevice {
                     )
                 })
             }
-        });
+        }?;
 
-        let max_brightness = try!(read_brightness(&first_device.path().join("max_brightness")));
+        let max_brightness = read_brightness(&first_device.path().join("max_brightness"))?;
 
         Ok(BacklitDevice {
-            max_brightness: max_brightness,
+            max_brightness,
             device_path: first_device.path(),
         })
     }
@@ -100,20 +96,20 @@ impl BacklitDevice {
             ));
         }
 
-        let max_brightness = try!(read_brightness(&device_path.join("max_brightness")));
+        let max_brightness = read_brightness(&device_path.join("max_brightness"))?;
 
         Ok(BacklitDevice {
-            max_brightness: max_brightness,
-            device_path: device_path,
+            max_brightness,
+            device_path,
         })
     }
 
     /// Query the brightness value for this backlit device, as a percent.
     pub fn brightness(&self) -> Result<u64> {
-        let raw = try!(read_brightness(&self.brightness_file()));
+        let raw = read_brightness(&self.brightness_file())?;
         let brightness = ((raw as f64 / self.max_brightness as f64) * 100.0).round() as u64;
         match brightness {
-            0...100 => Ok(brightness),
+            0..=100 => Ok(brightness),
             _ => Ok(100),
         }
     }
@@ -131,7 +127,7 @@ impl BacklitDevice {
             return Ok(());
         }
         let safe_value = match value {
-            0...100 => value,
+            0..=100 => value,
             _ => 100,
         };
         let raw = (((safe_value as f64) / 100.0) * (self.max_brightness as f64)).round() as u64;
@@ -182,10 +178,10 @@ impl ConfigBlock for Backlight {
     type Config = BacklightConfig;
 
     fn new(block_config: Self::Config, config: Config, tx_update_request: Sender<Task>) -> Result<Self> {
-        let device = try!(match block_config.device {
+        let device = match block_config.device {
             Some(path) => BacklitDevice::from_device(path),
             None => BacklitDevice::default(),
-        });
+        }?;
 
         let id = Uuid::new_v4().simple().to_string();
         let brightness_file = device.brightness_file();
@@ -193,7 +189,7 @@ impl ConfigBlock for Backlight {
         let backlight = Backlight {
             output: ButtonWidget::new(config, &id),
             id: id.clone(),
-            device: device,
+            device,
             step_width: block_config.step_width,
         };
 
@@ -215,7 +211,7 @@ impl ConfigBlock for Backlight {
                     tx_update_request.send(Task {
                         id: id.clone(),
                         update_time: Instant::now(),
-                    });
+                    }).unwrap();
                 }
 
                 // Avoid update spam.
@@ -229,29 +225,29 @@ impl ConfigBlock for Backlight {
 
 impl Block for Backlight {
     fn update(&mut self) -> Result<Option<Duration>> {
-        let brightness = try!(self.device.brightness());
+        let brightness = self.device.brightness()?;
         self.output.set_text(format!("{}%", brightness));
         match brightness {
-            0...19 => self.output.set_icon("backlight_empty"),
-            20...39 => self.output.set_icon("backlight_partial1"),
-            40...59 => self.output.set_icon("backlight_partial2"),
-            60...79 => self.output.set_icon("backlight_partial3"),
+            0..=19 => self.output.set_icon("backlight_empty"),
+            20..=39 => self.output.set_icon("backlight_partial1"),
+            40..=59 => self.output.set_icon("backlight_partial2"),
+            60..=79 => self.output.set_icon("backlight_partial3"),
             _ => self.output.set_icon("backlight_full"),
         }
         Ok(None)
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.output]
     }
 
     fn click(&mut self, event: &I3BarEvent) -> Result<()> {
         if let Some(ref name) = event.name {
             if name.as_str() == self.id {
-                let brightness = try!(self.device.brightness());
+                let brightness = self.device.brightness()?;
                 match event.button {
                     MouseButton::WheelUp => {
-                        if brightness <= 100 {
+                        if brightness < 100 {
                             self.device.set_brightness(brightness + self.step_width)?;
                         }
                     }

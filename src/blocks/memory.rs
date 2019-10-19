@@ -2,7 +2,7 @@
 //!
 //! Creates a block displaying memory and swap usage.
 //!
-//! By default, the format of this module is "<Icon>: {MFm}MB/{MTm}MB({Mp}%)" (Swap values
+//! By default, the format of this module is "<Icon>: {MFm}MB/{MTm}MB({MUp}%)" (Swap values
 //! accordingly). That behaviour can be changed within config.json.
 //!
 //! This module keeps track of both Swap and Memory. By default, a click switches between them.
@@ -21,8 +21,8 @@
 //!
 //! Key | Values | Required | Default
 //! ----|--------|----------|--------
-//! format_mem | Format string for Memory view. All format values are described below. | No | {MFm}MB/{MTm}MB({Mp}%)
-//! format_swap | Format string for Swap view. | No | {SFm}MB/{STm}MB({Sp}%)
+//! format_mem | Format string for Memory view. All format values are described below. | No | {MFm}MB/{MTm}MB({MUp}%)
+//! format_swap | Format string for Swap view. | No | {SFm}MB/{STm}MB({SUp}%)
 //! type | Default view displayed on startup. Options are <br/> memory, swap | No | memory
 //! icons | Whether the format string should be prepended with Icons. Options are <br/> true, false | No | true
 //! clickable | Whether the view should switch between memory and swap on click. Options are <br/> true, false | No | true
@@ -34,55 +34,62 @@
 //!
 //! ### Format string specification
 //!
-//! Key | Value
-//! ----|-------
-//! {MTg} | Memory total (GiB)
-//! {MTm} | Memory total (MiB)
-//! {MAg} | Available emory, including cached memory and buffers (GiB)
-//! {MAm} | Available memory, including cached memory and buffers (MiB)
-//! {MAp} | Available memory, including cached memory and buffers (%)
-//! {MFg} | Memory free (GiB)
-//! {MFm} | Memory free (MiB)
-//! {MFp} | Memory free (%)
-//! {Mug} | Memory used, excluding cached memory and buffers; similar to htop's green bar (GiB)
-//! {Mum} | Memory used, excluding cached memory and buffers; similar to htop's green bar (MiB)
-//! {Mup} | Memory used, excluding cached memory and buffers; similar to htop's green bar (%)
-//! {MUg} | Total memory used (GiB)
-//! {MUm} | Total memory used (MiB)
-//! {MUp} | Total memory used (%)
-//! {Cg}  | Cached memory, similar to htop's yellow bar (GiB)
-//! {Cm}  | Cached memory, similar to htop's yellow bar (MiB)
-//! {Cp}  | Cached memory, similar to htop's yellow bar (%)
-//! {Bg}  | Buffers, similar to htop's blue bar (GiB)
-//! {Bm}  | Buffers, similar to htop's blue bar (MiB)
-//! {Bp}  | Buffers, similar to htop's blue bar (%)
-//! {STg} | Swap total (GiB)
-//! {STm} | Swap total (MiB)
-//! {SFg} | Swap free (GiB)
-//! {SFm} | Swap free (MiB)
-//! {SFp} | Swap free (%)
-//! {SUg} | Swap used (GiB)
-//! {SUm} | Swap used (MiB)
-//! {SUp} | Swap used (%)
+//!  Key   | Value
+//! -------|-------
+//! {MTg}  | Memory total (GiB)
+//! {MTm}  | Memory total (MiB)
+//! {MAg}  | Available emory, including cached memory and buffers (GiB)
+//! {MAm}  | Available memory, including cached memory and buffers (MiB)
+//! {MAp}  | Available memory, including cached memory and buffers (%)
+//! {MApi} | Available memory, including cached memory and buffers (%) as integer
+//! {MFg}  | Memory free (GiB)
+//! {MFm}  | Memory free (MiB)
+//! {MFp}  | Memory free (%)
+//! {MFpi} | Memory free (%) as integer
+//! {Mug}  | Memory used, excluding cached memory and buffers; similar to htop's green bar (GiB)
+//! {Mum}  | Memory used, excluding cached memory and buffers; similar to htop's green bar (MiB)
+//! {Mup}  | Memory used, excluding cached memory and buffers; similar to htop's green bar (%)
+//! {MUg}  | Total memory used (GiB)
+//! {MUm}  | Total memory used (MiB)
+//! {MUp}  | Total memory used (%)
+//! {MUpi} | Total memory used (%) a integer
+//! {Cg}   | Cached memory, similar to htop's yellow bar (GiB)
+//! {Cm}   | Cached memory, similar to htop's yellow bar (MiB)
+//! {Cp}   | Cached memory, similar to htop's yellow bar (%)
+//! {Bg}   | Buffers, similar to htop's blue bar (GiB)
+//! {Bm}   | Buffers, similar to htop's blue bar (MiB)
+//! {Bp}   | Buffers, similar to htop's blue bar (%)
+//! {Bpi}  | Buffers, similar to htop's blue bar (%) as integer
+//! {STg}  | Swap total (GiB)
+//! {STm}  | Swap total (MiB)
+//! {SFg}  | Swap free (GiB)
+//! {SFm}  | Swap free (MiB)
+//! {SFp}  | Swap free (%)
+//! {SFpi} | Swap free (%) as integer
+//! {SUg}  | Swap used (GiB)
+//! {SUm}  | Swap used (MiB)
+//! {SUp}  | Swap used (%)
+//! {SUpi} | Swap used (%) as integer
+
 //!
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
-use util::*;
-use chan::Sender;
+use crate::util::*;
+use crossbeam_channel::Sender;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use block::{Block, ConfigBlock};
-use input::{I3BarEvent, MouseButton};
+use crate::blocks::{Block, ConfigBlock};
+use crate::input::{I3BarEvent, MouseButton};
 use std::str::FromStr;
 use uuid::Uuid;
 use std::fmt;
 
-use config::Config;
-use de::deserialize_duration;
-use errors::*;
-use widgets::button::ButtonWidget;
-use widget::{I3BarWidget, State};
-use scheduler::Task;
+use crate::config::Config;
+use crate::de::deserialize_duration;
+use crate::errors::*;
+use crate::widgets::button::ButtonWidget;
+use crate::widget::{I3BarWidget, State};
+use crate::scheduler::Task;
 
 use std::io::Write;
 use std::fs::OpenOptions;
@@ -275,11 +282,11 @@ pub struct MemoryConfig {
 
 impl MemoryConfig {
     fn default_format_mem() -> String {
-        "{MFm}MB/{MTm}MB({Mp}%)".to_owned()
+        "{MFm}MB/{MTm}MB({MUp}%)".to_owned()
     }
 
     fn default_format_swap() -> String {
-        "{SFm}MB/{STm}MB({Sp}%)".to_owned()
+        "{SFm}MB/{STm}MB({SUp}%)".to_owned()
     }
 
     fn default_display_type() -> Memtype {
@@ -342,6 +349,10 @@ impl Memory {
             "{MFp}".to_string(),
             format!("{:.2}", mem_free.percent(mem_total)),
         );
+        self.values.insert(
+            "{MFpi}".to_string(),
+            format!("{:02}", mem_free.percent(mem_total) as i32),
+        );
         self.values
             .insert("{MUg}".to_string(), format!("{:.1}", mem_total_used.gib()));
         self.values
@@ -349,6 +360,10 @@ impl Memory {
         self.values.insert(
             "{MUp}".to_string(),
             format!("{:.2}", mem_total_used.percent(mem_total)),
+        );
+        self.values.insert(
+            "{MUpi}".to_string(),
+            format!("{:02}", mem_total_used.percent(mem_total) as i32),
         );
         self.values
             .insert("{Mug}".to_string(), format!("{:.1}", mem_used.gib()));
@@ -358,6 +373,10 @@ impl Memory {
             "{Mup}".to_string(),
             format!("{:.2}", mem_used.percent(mem_total)),
         );
+        self.values.insert(
+            "{Mupi}".to_string(),
+            format!("{:02}", mem_used.percent(mem_total) as i32),
+        );
         self.values
             .insert("{MAg}".to_string(), format!("{:.1}", mem_avail.gib()));
         self.values
@@ -365,6 +384,10 @@ impl Memory {
         self.values.insert(
             "{MAp}".to_string(),
             format!("{:.2}", mem_avail.percent(mem_total)),
+        );
+        self.values.insert(
+            "{MApi}".to_string(),
+            format!("{:02}", mem_avail.percent(mem_total) as i32),
         );
         self.values
             .insert("{STg}".to_string(), format!("{:.1}", swap_total.gib()));
@@ -378,6 +401,10 @@ impl Memory {
             "{SFp}".to_string(),
             format!("{:.2}", swap_free.percent(swap_total)),
         );
+        self.values.insert(
+            "{SFpi}".to_string(),
+            format!("{:02}", swap_free.percent(swap_total) as i32),
+        );
         self.values
             .insert("{SUg}".to_string(), format!("{:.1}", swap_used.gib()));
         self.values
@@ -385,6 +412,10 @@ impl Memory {
         self.values.insert(
             "{SUp}".to_string(),
             format!("{:.2}", swap_used.percent(swap_total)),
+        );
+        self.values.insert(
+            "{SUpi}".to_string(),
+            format!("{:02}", swap_used.percent(swap_total) as i32),
         );
         self.values
             .insert("{Bg}".to_string(), format!("{:.1}", buffers.gib()));
@@ -394,6 +425,10 @@ impl Memory {
             "{Bp}".to_string(),
             format!("{:.2}", buffers.percent(mem_total)),
         );
+        self.values.insert(
+            "{Bpi}".to_string(),
+            format!("{:02}", buffers.percent(mem_total) as i32),
+        );
         self.values
             .insert("{Cg}".to_string(), format!("{:.1}", cached.gib()));
         self.values
@@ -402,17 +437,21 @@ impl Memory {
             "{Cp}".to_string(),
             format!("{:.2}", cached.percent(mem_total)),
         );
+        self.values.insert(
+            "{Cpi}".to_string(),
+            format!("{:02}", cached.percent(mem_total) as i32),
+        );
 
         match self.memtype {
             Memtype::Memory => self.output.0.set_state(match mem_used.percent(mem_total) {
-                x if x as f64 > self.critical.0 => State::Critical,
-                x if x as f64 > self.warning.0 => State::Warning,
+                x if f64::from(x) > self.critical.0 => State::Critical,
+                x if f64::from(x) > self.warning.0 => State::Warning,
                 _ => State::Idle,
             }),
             Memtype::Swap => self.output.1.set_state(
                 match swap_used.percent(swap_total) {
-                    x if x as f64 > self.critical.1 => State::Critical,
-                    x if x as f64 > self.warning.1 => State::Warning,
+                    x if f64::from(x)  > self.critical.1 => State::Critical,
+                    x if f64::from(x) > self.warning.1 => State::Warning,
                     _ => State::Idle,
                 },
             ),
@@ -462,8 +501,8 @@ impl ConfigBlock for Memory {
             },
             clickable: block_config.clickable,
             format: (
-                FormatTemplate::from_string(block_config.format_mem)?,
-                FormatTemplate::from_string(block_config.format_swap)?,
+                FormatTemplate::from_string(&block_config.format_mem)?,
+                FormatTemplate::from_string(&block_config.format_swap)?,
             ),
             update_interval: block_config.interval,
             tx_update_request: tx,
@@ -618,14 +657,14 @@ impl Block for Memory {
                 self.tx_update_request.send(Task {
                     id: self.id.clone(),
                     update_time: Instant::now(),
-                });
+                })?;
             }
         }
 
         Ok(())
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![
             match self.memtype {
                 Memtype::Memory => &self.output.0,

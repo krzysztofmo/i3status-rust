@@ -6,19 +6,26 @@ extern crate serde;
 #[macro_use]
 extern crate serde_json;
 #[macro_use]
-extern crate chan;
+extern crate crossbeam_channel;
 extern crate toml;
 extern crate clap;
 extern crate uuid;
 extern crate regex;
 extern crate num;
 extern crate inotify;
+extern crate maildir;
+extern crate chrono;
+extern crate chrono_tz;
+extern crate dbus;
+#[cfg(feature = "pulseaudio")]
+extern crate libpulse_binding as pulse;
+#[cfg(feature = "notmuch")]
+extern crate notmuch;
 
 #[macro_use]
 mod de;
 #[macro_use]
 mod util;
-mod block;
 pub mod blocks;
 mod config;
 mod errors;
@@ -26,38 +33,39 @@ mod input;
 mod icons;
 mod themes;
 mod scheduler;
+mod subprocess;
 mod widget;
 mod widgets;
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "profiling")]
 extern crate cpuprofiler;
-#[cfg(debug_assertions)]
+#[cfg(feature = "profiling")]
 use cpuprofiler::PROFILER;
-#[cfg(debug_assertions)]
+#[cfg(feature = "profiling")]
 extern crate progress;
 
 use std::collections::HashMap;
 use std::time::Duration;
 use std::ops::DerefMut;
 
-use block::Block;
+use crate::blocks::Block;
 
-use blocks::create_block;
-use config::Config;
-use errors::*;
-use input::{process_events, I3BarEvent};
-use scheduler::{Task, UpdateScheduler};
-use widget::{I3BarWidget, State};
-use widgets::text::TextWidget;
+use crate::blocks::create_block;
+use crate::config::Config;
+use crate::errors::*;
+use crate::input::{process_events, I3BarEvent};
+use crate::scheduler::{Task, UpdateScheduler};
+use crate::widget::{I3BarWidget, State};
+use crate::widgets::text::TextWidget;
 
-use util::deserialize_file;
+use crate::util::deserialize_file;
 
 use self::clap::{App, Arg, ArgMatches};
-use self::chan::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 
 fn main() {
     let mut builder = App::new("i3status-rs")
-        .version("0.9")
+        .version("0.11.0")
         .author(
             "Kai Greshake <development@kai-greshake.de>, Contributors on GitHub: \\
              https://github.com/greshake/i3status-rust/graphs/contributors",
@@ -93,7 +101,7 @@ fn main() {
                     .takes_value(true)
                     .default_value("10000")
                     .help("How many times to execute update when profiling."),
-            );;
+            );
     });
 
     let matches = builder.get_matches();
@@ -132,34 +140,13 @@ fn run(matches: &ArgMatches) -> Result<()> {
     let config: Config = deserialize_file(matches.value_of("config").unwrap())?;
 
     // Update request channel
-    let (tx_update_requests, rx_update_requests): (Sender<Task>, Receiver<Task>) = chan::async();
+    let (tx_update_requests, rx_update_requests): (Sender<Task>, Receiver<Task>) = crossbeam_channel::unbounded();
 
     // In dev build, we might diverge into profiling blocks here
-    #[cfg(debug_assertions)]
-    if_debug!({
-        if matches.value_of("profile").is_some() {
-            for &(ref block_name, ref block_config) in &config.blocks {
-                if block_name == matches.value_of("profile").unwrap() {
-                    let mut block = create_block(
-                        &block_name,
-                        block_config.clone(),
-                        config.clone(),
-                        tx_update_requests.clone(),
-                    )?;
-                    profile(
-                        matches
-                            .value_of("profile-runs")
-                            .unwrap()
-                            .parse::<i32>()
-                            .unwrap(),
-                        &block_name,
-                        block.deref_mut(),
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    });
+    if let Some(name) = matches.value_of("profile") {
+        profile_config(name, matches.value_of("profile-runs").unwrap(), &config, &tx_update_requests)?;
+        return Ok(());
+    }
 
     let mut config_alternating_tint = config.clone();
     {
@@ -188,7 +175,7 @@ fn run(matches: &ArgMatches) -> Result<()> {
             .configuration_error("can't parse alternative_tint color code")?;
     }
 
-    let mut blocks: Vec<Box<Block>> = Vec::new();
+    let mut blocks: Vec<Box<dyn Block>> = Vec::new();
 
     let mut alternator = false;
     // Initialize the blocks
@@ -208,64 +195,61 @@ fn run(matches: &ArgMatches) -> Result<()> {
 
     // We save the order of the blocks here,
     // because they will be passed to an unordered HashMap
-    let order = blocks.iter().map(|x| String::from(x.id())).collect();
+    let order = blocks.iter().map(|x| String::from(x.id())).collect::<Vec<_>>();
 
     let mut scheduler = UpdateScheduler::new(&blocks);
 
-    let mut block_map: HashMap<String, &mut Block> = HashMap::new();
+    let mut block_map: HashMap<String, &mut dyn Block> = HashMap::new();
 
     for block in &mut blocks {
         block_map.insert(String::from(block.id()), (*block).deref_mut());
     }
 
     // We wait for click events in a separate thread, to avoid blocking to wait for stdin
-    let (tx_clicks, rx_clicks): (Sender<I3BarEvent>, Receiver<I3BarEvent>) = chan::async();
+    let (tx_clicks, rx_clicks): (Sender<I3BarEvent>, Receiver<I3BarEvent>) = crossbeam_channel::unbounded();
     process_events(tx_clicks);
 
     // Time to next update channel.
     // Fires immediately for first updates
-    let mut ttnu = chan::after_ms(0);
+    let mut ttnu = crossbeam_channel::after(Duration::from_millis(0));
 
     loop {
         // We use the message passing concept of channel selection
         // to avoid busy wait
-
-        chan_select! {
+        select! {
             // Receive click events
-            rx_clicks.recv() -> res => match res {
-                Some(event) => {
+            recv(rx_clicks) -> res => if let Ok(event) = res {
                     for block in block_map.values_mut() {
                         block.click(&event)?;
                     }
                     util::print_blocks(&order, &block_map, &config)?;
-                },
-                None => ()
             },
             // Receive async update requests
-            rx_update_requests.recv() -> res => match res {
-                Some(request) => {
-                    scheduler.schedule(request);
-                },
-                None => ()
+            recv(rx_update_requests) -> request => if let Ok(req) = request {
+                // Process immediately and forget
+                block_map
+                    .get_mut(&req.id)
+                    .internal_error("scheduler", "could not get required block")?
+                    .update()?;
+                util::print_blocks(&order, &block_map, &config)?;
             },
             // Receive update timer events
-            ttnu.recv() => {
+            recv(ttnu) -> _ => {
                 scheduler.do_scheduled_updates(&mut block_map)?;
-
                 // redraw the blocks, state changed
                 util::print_blocks(&order, &block_map, &config)?;
-            }
+            },
         }
 
         // Set the time-to-next-update timer
         match scheduler.time_to_next_update() {
-            Some(time) => ttnu = chan::after(time),
-            None => ttnu = chan::after(Duration::from_secs(std::u64::MAX)),
+            Some(time) => ttnu = crossbeam_channel::after(time),
+            None => ttnu = crossbeam_channel::after(Duration::from_secs(std::u64::MAX)),
         }
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "profiling")]
 fn profile(iterations: i32, name: &str, block: &mut Block) {
     let mut bar = progress::Bar::new();
     println!(
@@ -289,4 +273,33 @@ fn profile(iterations: i32, name: &str, block: &mut Block) {
     }
 
     PROFILER.lock().unwrap().stop().unwrap();
+}
+
+#[cfg(feature = "profiling")]
+fn profile_config(name: &str, runs: &str, config: &Config, update: Sender<Task>) -> Result<()> {
+    let profile_runs = runs.parse::<i32>()
+        .configuration_error("failed to parse --profile-runs as an integer")?;
+    for &(ref block_name, ref block_config) in &config.blocks {
+        if block_name == name {
+            let mut block = create_block(
+                &block_name,
+                block_config.clone(),
+                config.clone(),
+                update.clone(),
+            )?;
+            profile(profile_runs, &block_name, block.deref_mut());
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "profiling"))]
+fn profile_config(_name: &str, _runs: &str, _config: &Config, _update: &Sender<Task>) -> Result<()> {
+    // TODO: Maybe we should just panic! here.
+    Err(InternalError(
+        "profile".to_string(),
+        "The 'profiling' feature was not enabled at compile time.".to_string(),
+        None,
+    ))
 }

@@ -1,20 +1,23 @@
+use std::ffi::OsStr;
+use std::process::Command;
 use std::time::{Duration, Instant};
-use chan::Sender;
+use crossbeam_channel::Sender;
 use std::thread;
 use std::boxed::Box;
 
-use config::Config;
-use errors::*;
-use scheduler::Task;
-use input::I3BarEvent;
-use block::{Block, ConfigBlock};
-use de::deserialize_duration;
-use widgets::rotatingtext::RotatingTextWidget;
-use widgets::button::ButtonWidget;
-use widget::{I3BarWidget, State};
+use crate::config::Config;
+use crate::errors::*;
+use crate::scheduler::Task;
+use crate::input::I3BarEvent;
+use crate::blocks::{Block, ConfigBlock};
+use crate::de::deserialize_duration;
+use crate::widgets::rotatingtext::RotatingTextWidget;
+use crate::widgets::button::ButtonWidget;
+use crate::widget::{I3BarWidget, State};
 
-use blocks::dbus::{arg, stdintf, BusType, Connection, ConnectionItem, Message};
-use self::stdintf::OrgFreedesktopDBusProperties;
+use dbus::{arg, BusType, Connection, ConnectionItem, Message};
+use dbus::arg::{Array, RefArg};
+use dbus::stdintf::org_freedesktop_dbus::Properties;
 use uuid::Uuid;
 
 pub struct Music {
@@ -23,17 +26,21 @@ pub struct Music {
     prev: Option<ButtonWidget>,
     play: Option<ButtonWidget>,
     next: Option<ButtonWidget>,
+    on_collapsed_click_widget: ButtonWidget,
+    on_collapsed_click: Option<String>,
     dbus_conn: Connection,
     player_avail: bool,
     marquee: bool,
-    player: String,
+    player: Option<String>,
+    auto_discover: bool
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct MusicConfig {
     /// Name of the music player.Must be the same name the player<br/> is registered with the MediaPlayer2 Interface.
-    pub player: String,
+    /// Set an empty string for auto-discovery of currently active player.
+    pub player: Option<String>,
 
     /// Max width of the block in characters, not including the buttons
     #[serde(default = "MusicConfig::default_max_width")]
@@ -54,6 +61,9 @@ pub struct MusicConfig {
     /// Array of control buttons to be displayed. Options are<br/>prev (previous title), play (play/pause) and next (next title)
     #[serde(default = "MusicConfig::default_buttons")]
     pub buttons: Vec<String>,
+
+    #[serde(default = "MusicConfig::default_on_collapsed_click")]
+    pub on_collapsed_click: Option<String>,
 }
 
 impl MusicConfig {
@@ -76,6 +86,10 @@ impl MusicConfig {
     fn default_buttons() -> Vec<String> {
         vec![]
     }
+
+    fn default_on_collapsed_click() -> Option<String> {
+        None
+    }
 }
 
 impl ConfigBlock for Music {
@@ -88,17 +102,15 @@ impl ConfigBlock for Music {
         thread::spawn(move || {
             let c = Connection::get_private(BusType::Session).unwrap();
             c.add_match(
-                "interface='org.freedesktop.DBus.Properties',member='PropertiesChanged'",
+                "interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',path='/org/mpris/MediaPlayer2'",
             ).unwrap();
             loop {
-                for ci in c.iter(100000) {
-                    if let ConnectionItem::Signal(msg) = ci {
-                        if &*msg.path().unwrap() == "/org/mpris/MediaPlayer2" && &*msg.member().unwrap() == "PropertiesChanged" {
-                            send.send(Task {
-                                id: id.clone(),
-                                update_time: Instant::now(),
-                            });
-                        }
+                for ci in c.iter(100_000) {
+                    if let ConnectionItem::Signal(_) = ci {
+                        send.send(Task {
+                            id: id.clone(),
+                            update_time: Instant::now(),
+                        }).unwrap();
                     }
                 }
             }
@@ -146,13 +158,25 @@ impl ConfigBlock for Music {
                 config.clone(),
             ).with_icon("music")
                 .with_state(State::Info),
-            prev: prev,
-            play: play,
-            next: next,
+            prev,
+            play,
+            next,
+            on_collapsed_click_widget: ButtonWidget::new(
+                config.clone(),
+                "on_collapsed_click",
+            ).with_icon("music")
+                .with_state(State::Info),
+            on_collapsed_click: block_config.on_collapsed_click,
             dbus_conn: Connection::get_private(BusType::Session)
                 .block_error("music", "failed to establish D-Bus connection")?,
             player_avail: false,
-            player: block_config.player,
+            auto_discover: block_config.player.is_none(),
+            player: if block_config.player.is_none()
+                {
+                    block_config.player
+                } else {
+                    Some(format!("org.mpris.MediaPlayer2.{}", block_config.player.unwrap()))
+                },
             marquee: block_config.marquee,
         })
     }
@@ -169,21 +193,18 @@ impl Block for Music {
         } else {
             (false, None)
         };
-
-        if !rotated {
+        if !rotated && self.player.is_none() {
+            self.player = get_first_available_player(&self.dbus_conn)
+        }
+        if !(rotated || self.player.is_none()) {
             let c = self.dbus_conn.with_path(
-                format!("org.mpris.MediaPlayer2.{}", self.player),
+                self.player.clone().unwrap(),
                 "/org/mpris/MediaPlayer2",
                 1000,
             );
             let data = c.get("org.mpris.MediaPlayer2.Player", "Metadata");
 
-            if data.is_err() {
-                self.current_song.set_text(String::from(""));
-                self.player_avail = false;
-            } else {
-                let metadata = data.unwrap();
-
+            if let Ok(metadata) = data {
                 let (title, artist) = extract_from_metadata(&metadata).unwrap_or((String::new(), String::new()));
 
                 if title.is_empty() && artist.is_empty() {
@@ -194,13 +215,21 @@ impl Block for Music {
                     self.current_song
                         .set_text(format!("{} | {}", title, artist));
                 }
+            } else {
+                self.current_song.set_text(String::from(""));
+                self.player_avail = false;
+                if self.auto_discover {
+                    self.player = None;
+                }
             }
+
             if let Some(ref mut play) = self.play {
                 let data = c.get("org.mpris.MediaPlayer2.Player", "PlaybackStatus");
                 match data {
                     Err(_) => play.set_icon("music_play"),
                     Ok(data) => {
-                        let state = data.0;
+                        let data: Box<dyn RefArg> = data;
+                        let state = data;
                         if state.as_str().map(|s| s != "Playing").unwrap_or(false) {
                             play.set_icon("music_play")
                         } else {
@@ -212,8 +241,7 @@ impl Block for Music {
         }
         Ok(match (next, self.marquee) {
             (Some(_), _) => next,
-            (None, true) => Some(Duration::new(1, 0)),
-            (None, false) => Some(Duration::new(1, 0)),
+            (None, _) => Some(Duration::new(2, 0))
         })
     }
 
@@ -227,7 +255,7 @@ impl Block for Music {
             };
             if action != "" {
                 let m = Message::new_method_call(
-                    format!("org.mpris.MediaPlayer2.{}", self.player),
+                    self.player.as_ref().unwrap(),
                     "/org/mpris/MediaPlayer2",
                     "org.mpris.MediaPlayer2.Player",
                     action,
@@ -237,6 +265,14 @@ impl Block for Music {
                     .block_error("music", "failed to call method via D-Bus")
                     .map(|_| ())
             } else {
+                if name == "on_collapsed_click" && self.on_collapsed_click.is_some() {
+                    let command = self.on_collapsed_click.clone().unwrap();
+                    let command_broken: Vec<&str> = command.split_whitespace().collect();
+                    let mut itr = command_broken.iter();
+                    let mut _cmd = Command::new(OsStr::new(&itr.next().unwrap()))
+                        .args(itr)
+                        .spawn();
+                }
                 Ok(())
             }
         } else {
@@ -244,32 +280,35 @@ impl Block for Music {
         }
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         if self.player_avail {
-            let mut elements: Vec<&I3BarWidget> = Vec::new();
+            let mut elements: Vec<&dyn I3BarWidget> = Vec::new();
             elements.push(&self.current_song);
             if let Some(ref prev) = self.prev {
                 elements.push(prev);
             }
             if let Some(ref play) = self.play {
-                elements.push(play);;
+                elements.push(play);
             }
             if let Some(ref next) = self.next {
-                elements.push(next);;
+                elements.push(next);
             }
             elements
         } else {
-            vec![&self.current_song]
+            if self.current_song.is_empty() {
+                vec![&self.on_collapsed_click_widget]
+            } else {
+                vec![&self.current_song]
+            }
         }
     }
 }
 
-fn extract_from_metadata(metadata: &arg::Variant<Box<arg::RefArg>>) -> Result<(String, String)> {
+fn extract_from_metadata(metadata: &Box<dyn arg::RefArg>) -> Result<(String, String)> {
     let mut title = String::new();
     let mut artist = String::new();
 
     let mut iter = metadata
-        .0
         .as_iter()
         .block_error("music", "failed to extract metadata")?;
 
@@ -305,4 +344,16 @@ fn extract_from_metadata(metadata: &arg::Variant<Box<arg::RefArg>>) -> Result<(S
         };
     }
     Ok((title, artist))
+}
+
+fn get_first_available_player(connection: &Connection) -> Option<String> {
+    let m = Message::new_method_call("org.freedesktop.DBus", "/", "org.freedesktop.DBus", "ListNames").unwrap();
+    let r = connection.send_with_reply_and_block(m, 2000).unwrap();
+    // ListNames returns one argument, which is an array of strings.
+    let mut arr: Array<&str, _>  = r.get1().unwrap();
+    if let Some(name) = arr.find(|entry| entry.starts_with("org.mpris.MediaPlayer2")) {
+        Some(String::from(name))
+    } else {
+        None
+    }
 }

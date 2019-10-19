@@ -1,6 +1,6 @@
-use block::Block;
-use config::Config;
-use errors::*;
+use crate::blocks::Block;
+use crate::config::Config;
+use crate::errors::*;
 use std::collections::HashMap;
 use serde::de::DeserializeOwned;
 use serde_json::value::Value;
@@ -8,10 +8,19 @@ use toml;
 use regex::Regex;
 use std::prelude::v1::String;
 use std::fmt::Display;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::num::ParseIntError;
+use std::path::{Path, PathBuf};
+
+pub fn xdg_config_home() -> PathBuf {
+    // In the unlikely event that $HOME is not set, it doesn't really matter
+    // what we fall back on, so use /.config.
+    let config_path = std::env::var("XDG_CONFIG_HOME")
+        .unwrap_or(format!("{}/.config", std::env::var("HOME").unwrap_or("".to_string())));
+    PathBuf::from(&config_path)
+}
 
 pub fn deserialize_file<T>(file: &str) -> Result<T>
 where
@@ -19,10 +28,23 @@ where
 {
     let mut contents = String::new();
     let mut file = BufReader::new(File::open(file)
-        .internal_error("util", "failed to open file")?);
+        .internal_error("util",&format!("failed to open file: {}", file))?);
     file.read_to_string(&mut contents)
         .internal_error("util", "failed to read file")?;
     toml::from_str(&contents).configuration_error("failed to parse TOML from file contents")
+}
+
+pub fn read_file(blockname: &str, path: &Path) -> Result<String> {
+    let mut f = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .block_error(blockname, &format!("failed to open file {}", path.to_string_lossy()))?;
+    let mut content = String::new();
+    f.read_to_string(&mut content)
+        .block_error(blockname, &format!("failed to read {}", path.to_string_lossy()))?;
+    // Removes trailing newline
+    content.pop();
+    Ok(content)
 }
 
 #[allow(dead_code)]
@@ -84,7 +106,7 @@ impl PrintState {
     }
 }
 
-pub fn print_blocks(order: &Vec<String>, block_map: &HashMap<String, &mut Block>, config: &Config) -> Result<()> {
+pub fn print_blocks(order: &[String], block_map: &HashMap<String, &mut dyn Block>, config: &Config) -> Result<()> {
     let mut state = PrintState {
         has_predecessor: false,
         last_bg: None,
@@ -96,7 +118,7 @@ pub fn print_blocks(order: &Vec<String>, block_map: &HashMap<String, &mut Block>
             .get(block_id)
             .internal_error("util", "couldn't get block by id")?));
         let widgets = block.view();
-        if widgets.len() == 0 {
+        if widgets.is_empty() {
             continue;
         }
         let first = widgets[0];
@@ -121,7 +143,8 @@ pub fn print_blocks(order: &Vec<String>, block_map: &HashMap<String, &mut Block>
                     "separator": false,
                     "separator_block_width": 0,
                     "background": if sep_bg.is_some() { Value::String(sep_bg.unwrap()) } else { Value::Null },
-                    "color": sep_fg
+                    "color": sep_fg,
+                    "markup": "pango"
                 });
         print!("{}{},", if state.has_predecessor { "," } else { "" },
                separator.to_string());
@@ -145,26 +168,29 @@ pub fn print_blocks(order: &Vec<String>, block_map: &HashMap<String, &mut Block>
     Ok(())
 }
 
-pub fn get_color_from_html(color: &str) -> ::std::result::Result<(u8, u8, u8), ParseIntError> {
+pub fn color_from_rgba(color: &str) -> ::std::result::Result<(u8, u8, u8, u8), ParseIntError> {
     Ok((
         u8::from_str_radix(&color[1..3], 16)?,
         u8::from_str_radix(&color[3..5], 16)?,
         u8::from_str_radix(&color[5..7], 16)?,
+        u8::from_str_radix(&color.get(7..9).unwrap_or("FF"), 16)?,
     ))
 }
 
-pub fn color_to_html(color: (u8, u8, u8)) -> String {
-    format!("#{:02X}{:02X}{:02X}", color.0, color.1, color.2)
+pub fn color_to_rgba(color: (u8, u8, u8, u8)) -> String {
+    format!("#{:02X}{:02X}{:02X}{:02X}", color.0, color.1, color.2, color.3)
 }
 
 // TODO: Allow for other non-additive tints
 pub fn add_colors(a: &str, b: &str) -> ::std::result::Result<String, ParseIntError> {
-    let (r_a, g_a, b_a) = get_color_from_html(a)?;
-    let (r_b, g_b, b_b) = get_color_from_html(b)?;
-    Ok(color_to_html((
+    let (r_a, g_a, b_a, a_a) = color_from_rgba(a)?;
+    let (r_b, g_b, b_b, a_b) = color_from_rgba(b)?;
+
+    Ok(color_to_rgba((
         r_a.checked_add(r_b).unwrap_or(255),
         g_a.checked_add(g_b).unwrap_or(255),
         b_a.checked_add(b_b).unwrap_or(255),
+        a_a.checked_add(a_b).unwrap_or(255),
     )))
 }
 
@@ -175,8 +201,8 @@ pub enum FormatTemplate {
 }
 
 impl FormatTemplate {
-    pub fn from_string(s: String) -> Result<FormatTemplate> {
-        let s_as_bytes = s.clone().into_bytes();
+    pub fn from_string(s: &str) -> Result<FormatTemplate> {
+        let s_as_bytes = s.as_bytes();
 
         //valid var tokens: {} containing any amount of alphanumericals
         let re = Regex::new(r"\{[a-zA-Z0-9]+?\}")
@@ -229,7 +255,7 @@ impl FormatTemplate {
             }
             Var(ref key, ref next) => {
                 rendered.push_str(
-                    &format!("{}", vars.get(key).expect(&format!("Unknown placeholder in format string: {}", key))),
+                    &format!("{}", vars.get(key).unwrap_or_else(|| panic!("Unknown placeholder in format string: {}", key))),
                 );
                 if let Some(ref next) = *next {
                     rendered.push_str(&*next.render(vars));

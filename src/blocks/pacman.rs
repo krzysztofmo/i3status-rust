@@ -5,16 +5,16 @@ use std::time::Duration;
 use std::process::Command;
 use std::env;
 use std::ffi::OsString;
-use chan::Sender;
-use scheduler::Task;
+use crossbeam_channel::Sender;
+use crate::scheduler::Task;
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use de::deserialize_duration;
-use errors::*;
-use input::{I3BarEvent, MouseButton};
-use widgets::button::ButtonWidget;
-use widget::{I3BarWidget, State};
+use crate::blocks::{Block, ConfigBlock};
+use crate::config::Config;
+use crate::de::deserialize_duration;
+use crate::errors::*;
+use crate::input::{I3BarEvent, MouseButton};
+use crate::widgets::button::ButtonWidget;
+use crate::widget::{I3BarWidget, State};
 
 use uuid::Uuid;
 
@@ -120,16 +120,18 @@ fn get_update_count() -> Result<usize> {
     Ok(
         String::from_utf8(
             Command::new("sh")
+                .env("LC_ALL", "C")
                 .args(&[
                     "-c",
-                    &format!("fakeroot pacman -Su -p --dbpath \"{}\"", updates_db),
+                    &format!("fakeroot pacman -Qu --dbpath \"{}\"", updates_db),
                 ])
                 .output()
                 .block_error("pacman", "There was a problem running the pacman commands")?
                 .stdout,
         ).block_error("pacman", "there was a problem parsing the output")?
             .lines()
-            .count() - 1,
+            .filter(|line| !line.contains("[ignored]"))
+            .count(),
     )
 }
 
@@ -146,7 +148,7 @@ impl Block for Pacman {
 
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.output]
     }
 

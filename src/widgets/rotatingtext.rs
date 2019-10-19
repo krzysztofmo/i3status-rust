@@ -1,7 +1,7 @@
-use config::Config;
-use errors::*;
+use crate::config::Config;
+use crate::errors::*;
 use std::time::{Duration, Instant};
-use widget::{I3BarWidget, State};
+use crate::widget::{I3BarWidget, State};
 use serde_json::value::Value;
 
 #[derive(Clone, Debug)]
@@ -25,7 +25,7 @@ impl RotatingTextWidget {
     pub fn new(interval: Duration, speed: Duration, width: usize, config: Config) -> RotatingTextWidget {
         RotatingTextWidget {
             rotation_pos: 0,
-            width: width,
+            width,
             rotation_interval: interval,
             rotation_speed: speed,
             next_rotation: None,
@@ -40,7 +40,7 @@ impl RotatingTextWidget {
                 "color": "#000000"
             }),
             cached_output: None,
-            config: config,
+            config,
             rotating: false,
         }
     }
@@ -92,6 +92,10 @@ impl RotatingTextWidget {
         self.update()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
     fn get_rotated_content(&self) -> String {
         if self.content.len() > self.width {
             let missing = (self.rotation_pos + self.width).saturating_sub(self.content.len());
@@ -126,7 +130,7 @@ impl RotatingTextWidget {
                                 self.get_rotated_content()),
             "separator": false,
             "separator_block_width": 0,
-            "min_width": if self.content == "" {0} else {240},
+            "min_width": if self.content == "" {"".to_string()} else {"0".repeat(self.width+5)},
             "align": "left",
             "background": key_bg,
             "color": key_fg
@@ -137,18 +141,19 @@ impl RotatingTextWidget {
 
     pub fn next(&mut self) -> Result<(bool, Option<Duration>)> {
         if let Some(next_rotation) = self.next_rotation {
-            if next_rotation > Instant::now() {
-                Ok((false, Some(next_rotation - Instant::now())))
+            let now = Instant::now();
+            if next_rotation > now {
+                Ok((false, Some(next_rotation - now)))
             } else if self.rotating {
                 if self.rotation_pos < self.content.len() {
                     self.rotation_pos += 1;
-                    self.next_rotation = Some(Instant::now() + self.rotation_speed);
+                    self.next_rotation = Some(now + self.rotation_speed);
                     self.update();
                     Ok((true, Some(self.rotation_speed)))
                 } else {
                     self.rotation_pos = 0;
                     self.rotating = false;
-                    self.next_rotation = Some(Instant::now() + self.rotation_interval);
+                    self.next_rotation = Some(now + self.rotation_interval);
                     self.update();
                     Ok((true, Some(self.rotation_interval)))
                 }

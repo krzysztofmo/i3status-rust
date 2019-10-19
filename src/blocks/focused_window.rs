@@ -1,14 +1,14 @@
 use std::time::{Duration, Instant};
-use chan::Sender;
+use crossbeam_channel::Sender;
 use std::thread;
 use std::sync::{Arc, Mutex};
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use errors::*;
-use widgets::text::TextWidget;
-use widget::I3BarWidget;
-use scheduler::Task;
+use crate::blocks::{Block, ConfigBlock};
+use crate::config::Config;
+use crate::errors::*;
+use crate::widgets::text::TextWidget;
+use crate::widget::I3BarWidget;
+use crate::scheduler::Task;
 
 use uuid::Uuid;
 
@@ -68,7 +68,7 @@ impl ConfigBlock for FocusedWindow {
                                 tx.send(Task {
                                     id: id_clone.clone(),
                                     update_time: Instant::now(),
-                                });
+                                }).unwrap();
                             },
                             WindowChange::Title => if e.container.focused {
                                 if let Some(name) = e.container.name {
@@ -77,7 +77,7 @@ impl ConfigBlock for FocusedWindow {
                                     tx.send(Task {
                                         id: id_clone.clone(),
                                         update_time: Instant::now(),
-                                    });
+                                    }).unwrap();
                                 }
                             },
                             WindowChange::Close => if let Some(name) = e.container.name {
@@ -87,25 +87,22 @@ impl ConfigBlock for FocusedWindow {
                                     tx.send(Task {
                                         id: id_clone.clone(),
                                         update_time: Instant::now(),
-                                    });
+                                    }).unwrap();
                                 }
                             },
                             _ => {}
                         };
                     }
                     Event::WorkspaceEvent(e) => {
-                        match e.change {
-                            WorkspaceChange::Init => {
-                                let mut title = title_original.lock().unwrap();
-                                *title = String::from("");
-                                tx.send(Task {
-                                    id: id_clone.clone(),
-                                    update_time: Instant::now(),
-                                });
-                            }
-                            _ => {}
-                        };
-                    }
+                        if let WorkspaceChange::Init = e.change {
+                            let mut title = title_original.lock().unwrap();
+                            *title = String::from("");
+                            tx.send(Task {
+                                id: id_clone.clone(),
+                                update_time: Instant::now(),
+                            }).unwrap();
+                        }
+                    },
                     _ => unreachable!(),
                 }
             }
@@ -132,7 +129,7 @@ impl Block for FocusedWindow {
         Ok(None)
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         let title = &*self.title.lock().unwrap();
         if String::is_empty(title) {
             vec![]

@@ -1,20 +1,18 @@
-extern crate chrono;
-
 use std::time::Duration;
-use std::process::Command;
-use std::ffi::OsStr;
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use de::deserialize_duration;
-use errors::*;
-use self::chrono::offset::Local;
-use scheduler::Task;
-use chan::Sender;
-use widgets::button::ButtonWidget;
-use widget::I3BarWidget;
-use input::I3BarEvent;
+use crate::blocks::{Block, ConfigBlock};
+use crossbeam_channel::Sender;
+use chrono::offset::{Local, Utc};
+use chrono_tz::Tz;
+use crate::config::Config;
+use crate::de::{deserialize_duration, deserialize_timezone};
+use crate::errors::*;
+use crate::input::I3BarEvent;
+use crate::scheduler::Task;
 use uuid::Uuid;
+use crate::widget::I3BarWidget;
+use crate::widgets::button::ButtonWidget;
+use crate::subprocess::{parse_command, spawn_child_async};
 
 pub struct Time {
     time: ButtonWidget,
@@ -22,6 +20,7 @@ pub struct Time {
     update_interval: Duration,
     format: String,
     on_click: Option<String>,
+    timezone: Option<Tz>,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -37,6 +36,9 @@ pub struct TimeConfig {
 
     #[serde(default = "TimeConfig::default_on_click")]
     pub on_click: Option<String>,
+
+    #[serde(default = "TimeConfig::default_timezone", deserialize_with = "deserialize_timezone")]
+    pub timezone: Option<Tz>,
 }
 
 impl TimeConfig {
@@ -49,6 +51,10 @@ impl TimeConfig {
     }
 
     fn default_on_click() -> Option<String> {
+        None
+    }
+
+    fn default_timezone() -> Option<Tz> {
         None
     }
 }
@@ -66,38 +72,35 @@ impl ConfigBlock for Time {
                 .with_icon("time"),
             update_interval: block_config.interval,
             on_click: block_config.on_click,
+            timezone: block_config.timezone,
         })
     }
 }
 
 impl Block for Time {
     fn update(&mut self) -> Result<Option<Duration>> {
-        self.time
-            .set_text(format!("{}", Local::now().format(&self.format)));
+        let time = match self.timezone {
+            Some(tz) => Utc::now().with_timezone(&tz).format(&self.format),
+            None => Local::now().format(&self.format),
+        };
+        self.time.set_text(format!("{}", time));
         Ok(Some(self.update_interval))
     }
 
-
     fn click(&mut self, e: &I3BarEvent) -> Result<()> {
-        let mut command = "".to_string();
-        if self.on_click.is_some() {
-            command = self.on_click.clone().unwrap();
-        }
-
-
         if let Some(ref name) = e.name {
-            if name.as_str() == self.id && self.on_click.is_some() {
-                let command_broken: Vec<&str> = command.split_whitespace().collect();
-                let mut itr = command_broken.iter();
-                let mut _cmd = Command::new(OsStr::new(&itr.next().unwrap()))
-                    .args(itr)
-                    .spawn();
+            if name.as_str() == self.id {
+                if let Some(ref cmd) = self.on_click {
+                    let (cmd_name, cmd_args) = parse_command(cmd);
+                    spawn_child_async(cmd_name, &cmd_args)
+                        .block_error("time", "could not spawn child")?;
+                }
             }
         }
         Ok(())
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.time]
     }
 

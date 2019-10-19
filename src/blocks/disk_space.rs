@@ -1,27 +1,30 @@
 use std::time::Duration;
 use std::path::Path;
-use chan::Sender;
-use scheduler::Task;
+use crossbeam_channel::Sender;
+use crate::scheduler::Task;
 
-use block::{Block, ConfigBlock};
-use config::Config;
-use de::deserialize_duration;
-use errors::*;
-use widgets::text::TextWidget;
-use widget::{I3BarWidget, State};
+use crate::blocks::{Block, ConfigBlock};
+use crate::config::Config;
+use crate::de::deserialize_duration;
+use crate::errors::*;
+use crate::widgets::text::TextWidget;
+use crate::widget::{I3BarWidget, State};
 
 use uuid::Uuid;
 
 extern crate nix;
 
-use self::nix::sys::statvfs::vfs::Statvfs;
+use self::nix::sys::statvfs::statvfs;
 
-#[derive(Copy, Clone, Debug, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum Unit {
     MB,
     GB,
+    TB,
+    TiB,
     GiB,
     MiB,
+    Percent
 }
 
 impl Unit {
@@ -29,8 +32,11 @@ impl Unit {
         match unit {
             Unit::MB => bytes as f64 / 1000. / 1000.,
             Unit::GB => bytes as f64 / 1000. / 1000. / 1000.,
+            Unit::TB => bytes as f64 / 1000. / 1000. / 1000. / 1000.,
             Unit::MiB => bytes as f64 / 1024. / 1024.,
             Unit::GiB => bytes as f64 / 1024. / 1024. / 1024.,
+            Unit::TiB => bytes as f64 / 1024. / 1024. / 1024. / 1024.,
+            Unit::Percent => bytes as f64,
         }
     }
 }
@@ -40,9 +46,8 @@ impl Unit {
 pub enum InfoType {
     Available,
     Free,
-    // TODO: implement
-    //Total,
-    //Used,
+    Total,
+    Used,
 }
 
 pub struct DiskSpace {
@@ -55,6 +60,7 @@ pub struct DiskSpace {
     unit: Unit,
     warning: f64,
     alert: f64,
+    show_percentage: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -72,7 +78,7 @@ pub struct DiskSpaceConfig {
     #[serde(default = "DiskSpaceConfig::default_info_type")]
     pub info_type: InfoType,
 
-    /// Unit that is used to display disk space. Options are MB, MiB, GB and GiB
+    /// Unit that is used to display disk space. Options are MB, MiB, GB, GiB, TB and TiB
     #[serde(default = "DiskSpaceConfig::default_unit")]
     pub unit: Unit,
 
@@ -88,6 +94,9 @@ pub struct DiskSpaceConfig {
     #[serde(default = "DiskSpaceConfig::default_alert")]
     pub alert: f64,
 
+    /// Show percentage
+    #[serde(default = "DiskSpaceConfig::default_show_percentage")]
+    pub show_percentage: bool,
 }
 
 impl DiskSpaceConfig {
@@ -118,20 +127,38 @@ impl DiskSpaceConfig {
     fn default_alert() -> f64 {
         10.
     }
+
+    fn default_show_percentage() -> bool {
+        false
+    }
 }
 
 impl DiskSpace {
     fn compute_state(&self, bytes: u64, warning: f64, alert: f64) -> State {
-        let value = Unit::bytes_in_unit(Unit::GB, bytes);
-        match self.info_type {
-            InfoType::Available | InfoType::Free => if 0. <= value && value < alert {
-                State::Critical
-            } else if alert <= value && value < warning {
-                State::Warning
-            } else {
-                State::Idle
-            },
-            //InfoType::Total | InfoType::Used => unimplemented!(),
+        let value = if self.unit == Unit::Percent { bytes as f64 } else { Unit::bytes_in_unit(Unit::GB, bytes) };
+        match self.unit {
+            Unit::Percent => {
+                match self.info_type {
+                    InfoType::Available | InfoType::Free | InfoType::Total | InfoType::Used => if value > alert {
+                        State::Critical
+                    } else if value <= alert && value > warning {
+                        State::Warning
+                    } else {
+                        State::Idle
+                    }
+                }
+            }
+            _ => {
+                match self.info_type {
+                    InfoType::Available | InfoType::Free | InfoType::Total | InfoType::Used => if 0. <= value && value < alert {
+                        State::Critical
+                    } else if alert <= value && value < warning {
+                        State::Warning
+                    } else {
+                        State::Idle
+                    }
+                }
+            }
         }
     }
 }
@@ -150,35 +177,74 @@ impl ConfigBlock for DiskSpace {
             unit: block_config.unit,
             warning: block_config.warning,
             alert: block_config.alert,
+            show_percentage: block_config.show_percentage,
         })
     }
 }
 
 impl Block for DiskSpace {
     fn update(&mut self) -> Result<Option<Duration>> {
-        let statvfs = Statvfs::for_path(Path::new(self.path.as_str()))
+        let statvfs = statvfs(Path::new(self.path.as_str()))
             .block_error("disk_space", "failed to retrieve statvfs")?;
-        let result;
-        let converted;
+        let mut result;
+        let mut converted = 0.0f64;
+        let mut converted_str = String::new();
+        let total = (statvfs.blocks() as u64) * (statvfs.fragment_size() as u64);
+        let used = ((statvfs.blocks() as u64) - (statvfs.blocks_free() as u64)) * (statvfs.fragment_size() as u64);
 
         match self.info_type {
             InfoType::Available => {
-                result = statvfs.f_bavail * statvfs.f_bsize;
+                result = (statvfs.blocks_available() as u64) * (statvfs.block_size() as u64);
                 converted = Unit::bytes_in_unit(self.unit, result);
             }
             InfoType::Free => {
-                result = statvfs.f_bfree * statvfs.f_bsize;
+                result = (statvfs.blocks_free() as u64) * (statvfs.block_size() as u64);
                 converted = Unit::bytes_in_unit(self.unit, result);
             }
-            //InfoType::Total | InfoType::Used => unimplemented!(),
+            InfoType::Total => {
+                result = used;
+                let converted_used = Unit::bytes_in_unit(self.unit, result);
+                let converted_total = Unit::bytes_in_unit(self.unit, total);
+
+                converted_str = format!(
+                                    "{0:.2}/{1:.2}",
+                                    converted_used,
+                                    converted_total
+                                );
+            }
+            InfoType::Used => {
+                result = used;
+                converted = Unit::bytes_in_unit(self.unit, result);
+            }
         }
 
-        self.disk_space.set_text(format!(
-            "{0} {1:.2} {2:?}",
-            self.alias,
-            converted,
-            self.unit
-        ));
+        let percentage = (result as f32) / (total as f32) * 100f32;
+        if converted_str.is_empty() {
+            converted_str = format!("{0:.2}", converted);
+        }
+
+        if self.unit == Unit::Percent {
+            self.disk_space.set_text(format!("{0} {1:.2}%",
+                self.alias,
+                percentage
+            ));
+            result = percentage as u64;
+        } else if self.show_percentage {
+            self.disk_space.set_text(format!(
+                    "{0} {1} ({2:.2}%) {3:?}",
+                    self.alias,
+                    converted_str,
+                    percentage,
+                    self.unit
+                    ));
+        } else {
+            self.disk_space.set_text(format!(
+                    "{0} {1} {2:?}",
+                    self.alias,
+                    converted_str,
+                    self.unit
+                    ));
+        }
 
         let state = self.compute_state(result, self.warning, self.alert);
         self.disk_space.set_state(state);
@@ -186,7 +252,7 @@ impl Block for DiskSpace {
         Ok(Some(self.update_interval))
     }
 
-    fn view(&self) -> Vec<&I3BarWidget> {
+    fn view(&self) -> Vec<&dyn I3BarWidget> {
         vec![&self.disk_space]
     }
 
